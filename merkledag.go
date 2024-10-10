@@ -405,7 +405,7 @@ func WalkDepth(ctx context.Context, getLinks GetLinks, c cid.Cid, visit func(cid
 	}
 
 	if opts.Concurrency > 1 {
-		return parallelWalkDepth(ctx, getLinks, c, visit, opts)
+		return parallelSequentialWalkDepth(ctx, getLinks, c, visit, opts)
 	} else {
 		return sequentialWalkDepth(ctx, getLinks, c, 0, visit, opts)
 	}
