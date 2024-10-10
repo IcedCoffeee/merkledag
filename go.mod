@@ -1,4 +1,4 @@
-module merkeldag
+module github.com/IcedCoffeee/merkledag
 
 go 1.23.2
 
