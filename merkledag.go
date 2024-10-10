@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	bserv "github.com/ipfs/boxo/blockservice"
 	blocks "github.com/ipfs/go-block-format"
@@ -442,52 +443,92 @@ type branchTask struct {
 func parallelSequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, visit func(cid.Cid, int) bool, options *walkOptions) error {
 	workerCount := options.Concurrency
 	tasks := make(chan branchTask, workerCount)
+	results := make(chan branchTask, workerCount)
 	var wg sync.WaitGroup
-	errChan := make(chan error, workerCount)
+	errChan := make(chan error, 1)
 
+	var activeWorkers int32 // Use atomic operations for this
+
+	// Start worker goroutines
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for task := range tasks {
-				err := sequentialWalkDepth(ctx, getLinks, task.cid, task.depth, visit, options)
-				if err != nil {
-					select {
-					case errChan <- err:
-					default:
-					}
-					return
+				atomic.AddInt32(&activeWorkers, 1)
+
+				shouldVisit := true
+				if !(options.SkipRoot && task.depth == 0) {
+					shouldVisit = visit(task.cid, task.depth)
 				}
+
+				if shouldVisit {
+					links, err := getLinks(ctx, task.cid)
+					if err != nil {
+						if options.ErrorHandler != nil {
+							err = options.ErrorHandler(task.cid, err)
+						}
+						if err != nil {
+							select {
+							case errChan <- err:
+							default:
+							}
+							return
+						}
+					}
+
+					for _, link := range links {
+						select {
+						case results <- branchTask{cid: link.Cid, depth: task.depth + 1}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+
+				atomic.AddInt32(&activeWorkers, -1)
 			}
-		}()
+		}(i)
 	}
 
-	tasks <- branchTask{cid: root, depth: 0}
+	// Task distributor
+	go func() {
+		defer close(tasks)
+		defer close(results)
 
+		tasks <- branchTask{cid: root, depth: 0}
+
+		for result := range results {
+			select {
+			case tasks <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Wait for completion or error
 	go func() {
 		wg.Wait()
-		close(tasks)
+		close(errChan)
 	}()
 
-	select {
-	case err := <-errChan:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-waitChanClosed(tasks):
-		return nil
-	}
-}
-
-func waitChanClosed(ch chan branchTask) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		for range ch {
-			// Drain the channel
+	// Main loop
+	for {
+		select {
+		case err, ok := <-errChan:
+			if !ok {
+				return nil
+			}
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if atomic.LoadInt32(&activeWorkers) == 0 && len(tasks) == 0 && len(results) == 0 {
+				return nil
+			}
 		}
-		close(done)
-	}()
-	return done
+	}
 }
 
 // ProgressTracker is used to show progress when fetching nodes.
