@@ -407,7 +407,7 @@ func WalkDepth(ctx context.Context, getLinks GetLinks, c cid.Cid, visit func(cid
 	if opts.Concurrency > 1 {
 		return parallelWalkDepth(ctx, getLinks, c, visit, opts)
 	} else {
-		return sequentialWalkDepth(ctx, getLinks, c, 0, visit, opts)
+		return parallelSequentialWalkDepth(ctx, getLinks, c, 0, visit, opts)
 	}
 }
 
@@ -431,6 +431,57 @@ func sequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, d
 			return err
 		}
 	}
+	return nil
+}
+
+func parallelSequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, depth int, visit func(cid.Cid, int) bool, options *walkOptions) error {
+	if !(options.SkipRoot && depth == 0) {
+		if !visit(root, depth) {
+			return nil
+		}
+	}
+
+	links, err := getLinks(ctx, root)
+	if err != nil && options.ErrorHandler != nil {
+		err = options.ErrorHandler(root, err)
+	}
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	concurrencyLimit := make(chan struct{}, options.Concurrency)
+
+	results := make(chan cid.Cid)
+	defer close(results)
+
+	go func() {
+		for cid := range results {
+			if !visit(cid, depth+1) {
+				return
+			}
+		}
+	}()
+
+	for _, lnk := range links {
+		wg.Add(1)
+
+		go func(cid cid.Cid) {
+			defer wg.Done()
+
+			concurrencyLimit <- struct{}{}
+			defer func() { <-concurrencyLimit }()
+
+			if err := parallelSequentialWalkDepth(ctx, getLinks, cid, depth+1, visit, options); err != nil {
+				return
+			}
+
+			results <- cid
+		}(lnk.Cid)
+	}
+
+	wg.Wait()
+
 	return nil
 }
 
