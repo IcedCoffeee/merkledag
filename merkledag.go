@@ -407,7 +407,7 @@ func WalkDepth(ctx context.Context, getLinks GetLinks, c cid.Cid, visit func(cid
 	if opts.Concurrency > 1 {
 		return parallelWalkDepth(ctx, getLinks, c, visit, opts)
 	} else {
-		return parallelSequentialWalkDepth(ctx, getLinks, c, 0, visit, opts)
+		return sequentialWalkDepth(ctx, getLinks, c, 0, visit, opts)
 	}
 }
 
@@ -434,55 +434,60 @@ func sequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, d
 	return nil
 }
 
-func parallelSequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, depth int, visit func(cid.Cid, int) bool, options *walkOptions) error {
-	if !(options.SkipRoot && depth == 0) {
-		if !visit(root, depth) {
-			return nil
-		}
-	}
+type branchTask struct {
+	cid   cid.Cid
+	depth int
+}
 
-	links, err := getLinks(ctx, root)
-	if err != nil && options.ErrorHandler != nil {
-		err = options.ErrorHandler(root, err)
-	}
-	if err != nil {
-		return err
-	}
-
+func parallelSequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, visit func(cid.Cid, int) bool, options *walkOptions) error {
+	workerCount := options.Concurrency
+	tasks := make(chan branchTask, workerCount)
 	var wg sync.WaitGroup
-	concurrencyLimit := make(chan struct{}, options.Concurrency)
+	errChan := make(chan error, workerCount)
 
-	results := make(chan cid.Cid)
-	defer close(results)
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				err := sequentialWalkDepth(ctx, getLinks, task.cid, task.depth, visit, options)
+				if err != nil {
+					select {
+					case errChan <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	tasks <- branchTask{cid: root, depth: 0}
 
 	go func() {
-		for cid := range results {
-			if !visit(cid, depth+1) {
-				return
-			}
-		}
+		wg.Wait()
+		close(tasks)
 	}()
 
-	for _, lnk := range links {
-		wg.Add(1)
-
-		go func(cid cid.Cid) {
-			defer wg.Done()
-
-			concurrencyLimit <- struct{}{}
-			defer func() { <-concurrencyLimit }()
-
-			if err := parallelSequentialWalkDepth(ctx, getLinks, cid, depth+1, visit, options); err != nil {
-				return
-			}
-
-			results <- cid
-		}(lnk.Cid)
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-waitChanClosed(tasks):
+		return nil
 	}
+}
 
-	wg.Wait()
-
-	return nil
+func waitChanClosed(ch chan branchTask) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+			// Drain the channel
+		}
+		close(done)
+	}()
+	return done
 }
 
 // ProgressTracker is used to show progress when fetching nodes.
