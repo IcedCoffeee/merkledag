@@ -440,46 +440,113 @@ type branchTask struct {
 }
 
 func parallelSequentialWalkDepth(ctx context.Context, getLinks GetLinks, root cid.Cid, visit func(cid.Cid, int) bool, options *walkOptions) error {
-	workerCount := options.Concurrency
-	tasks := make(chan branchTask, workerCount)
-	var wg sync.WaitGroup
+	type cidDepth struct {
+		cid   cid.Cid
+		depth int
+	}
 
-	// Create a done channel to signal when all tasks are complete
+	type linksDepth struct {
+		links []*format.Link
+		depth int
+	}
+
+	feed := make(chan cidDepth, options.Concurrency)
+	out := make(chan linksDepth, options.Concurrency)
 	done := make(chan struct{})
 
-	for i := 0; i < workerCount; i++ {
+	var visitlk sync.Mutex
+	var wg sync.WaitGroup
+
+	errChan := make(chan error, 1)
+	fetchersCtx, cancel := context.WithCancel(ctx)
+	defer wg.Wait()
+	defer cancel()
+
+	for i := 0; i < options.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for task := range tasks {
-				err := sequentialWalkDepth(ctx, getLinks, task.cid, task.depth, visit, options)
-				if err != nil {
-					// Handle error if needed
-					return
+			for cdepth := range feed {
+				ci := cdepth.cid
+				depth := cdepth.depth
+
+				var shouldVisit bool
+
+				if !(options.SkipRoot && depth == 0) {
+					visitlk.Lock()
+					shouldVisit = visit(ci, depth)
+					visitlk.Unlock()
+				} else {
+					shouldVisit = true
+				}
+
+				if shouldVisit {
+					links, err := getLinks(fetchersCtx, ci)
+					if err != nil && options.ErrorHandler != nil {
+						err = options.ErrorHandler(root, err)
+					}
+					if err != nil {
+						select {
+						case errChan <- err:
+						case <-fetchersCtx.Done():
+						}
+						return
+					}
+
+					outLinks := linksDepth{
+						links: links,
+						depth: depth + 1,
+					}
+
+					select {
+					case out <- outLinks:
+					case <-fetchersCtx.Done():
+						return
+					}
+				}
+				select {
+				case done <- struct{}{}:
+				case <-fetchersCtx.Done():
 				}
 			}
 		}()
 	}
 
-	// Start a goroutine to process the root task and close the tasks channel when done
-	go func() {
-		defer close(tasks)
-		tasks <- branchTask{cid: root, depth: 0}
-	}()
+	var todoQueue []cidDepth
+	var inProgress int
 
-	// Wait for all workers to finish in a separate goroutine
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+	todoQueue = append(todoQueue, cidDepth{cid: root, depth: 0})
 
-	// Wait for either context cancellation or completion of all tasks
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return nil
+	for len(todoQueue) > 0 || inProgress > 0 {
+		for len(todoQueue) > 0 && inProgress < options.Concurrency {
+			next := todoQueue[0]
+			todoQueue = todoQueue[1:]
+			select {
+			case feed <- next:
+				inProgress++
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		select {
+		case <-done:
+			inProgress--
+		case linksDepth := <-out:
+			for _, lnk := range linksDepth.links {
+				todoQueue = append(todoQueue, cidDepth{
+					cid:   lnk.Cid,
+					depth: linksDepth.depth,
+				})
+			}
+		case err := <-errChan:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+
+	return nil
 }
 
 // ProgressTracker is used to show progress when fetching nodes.
